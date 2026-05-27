@@ -1,157 +1,196 @@
-# Digital Postcard Automation Pipeline (Agentic V2)
+# Digital Postcard — AI Content Moderation Pipeline
 
-This repository contains an advanced Agentic Systems Postcard Content QA pipeline, demonstrating production-level reliability, asynchronous orchestration with LangGraph, and Human-in-the-Loop (HITL) capabilities.
-
----
-
-## 💡 Why This Pipeline?
-Low-stakes AI (chatbots) can afford to be purely probabilistic. However, **enterprise-grade automation** (like Postcard Content QA) requires a **Deterministic AI Pipeline**. This project was built to solve the "unpredictability" problem of LLMs by:
-1.  **Guarding Profits**: Preventing costly printing of policy-violating or invalid postcards.
-2.  **Risk Mitigation**: Ensuring hateful or fraudulent content never reaches a customer.
-3.  **Human Efficiency**: Automating 90% of binary decisions while routing only the most ambiguous 10% to human experts.
+An end-to-end content moderation pipeline that combines Claude/OpenAI LLM evaluation with a Human-in-the-Loop (HITL) review gate, orchestrated as a stateful LangGraph `StateGraph`. Every decision is checkpointed to PostgreSQL so no state is lost between restarts or horizontal scaling events.
 
 ---
 
-## 🏗️ Deep Dive: Architecture & Design
-For a technical breakdown of the system's state machine, failure handling, and the "System that Builds Systems" pattern, see the [Architecture Overview](architecture_overview.md).
+## Architecture
+
+```
+Content Submission  (POST /api/v1/postcards/evaluate)
+        │
+        ▼
+[Deterministic Validation]
+  Pydantic length & regex guards
+  (no LLM tokens burned on junk input)
+        │
+        ▼
+[LangGraph StateGraph]
+        │
+   ┌────┴─────────────────────────────┐
+   │                                  │
+[ai_evaluate]                   [human_review]
+   │  LLM assesses content            │  Streamlit dashboard
+   │  quality & policy                │  human can approve /
+   │  (OpenAI structured output)      │  reject / override
+   └──────────────┬───────────────────┘
+                  │
+           [checkpoint]
+                  │  AsyncPostgresSaver writes every
+                  │  state transition to Postgres
+                  │  (full audit trail, time-travel debug)
+                  ▼
+     [APPROVED / REJECTED / NEEDS_REVIEW]
+                  │
+                  ▼
+        [Automated Actions]
+          Slack alert (NEEDS_REVIEW / severe violations)
+          Email to user (REJECTED)
+          DB persistence (all outcomes)
+```
 
 ---
 
-## 🛠️ Features & Engineering Standards
-- **Agentic Orchestration**: Uses **LangGraph** for non-linear, stateful reasoning, allowing for complex retry loops and conditional routing.
-- **Production Resilience**: Implements node-level error handling, exponential backoff, and non-blocking asynchronous execution.
-- **Operational Integrations**: 
-    - **Slack**: Real-time incident triage and moderation alerts via Webhooks.
-    - **Email**: Automated user notifications for rejections and policy updates.
-- **Memory Persistence**: Uses **PostgreSQL** to track the "order journey" (checkpointing), ensuring no state is lost during system restarts.
-- **Human-in-the-Loop**: Integrated Streamlit dashboard for manual review, providing the **Final Authority** on ambiguous content.
+## Why This Pattern Matters for Health Systems
+
+The HITL pattern — AI recommends, human decides, system records — is the right governance model for any high-stakes domain. In clinical AI, an LLM can surface danger signs and suggest a triage level; a trained supervisor reviews that recommendation before the CHW acts on it. The PostgreSQL checkpoint trail becomes a clinical audit log. This project's architecture maps directly onto that model; see `src/health_extension/chw_triage.py` for a concrete CHW triage adaptation.
 
 ---
 
-## 🏗️ Architectural Decisions & Trade-offs
+## Stack
 
-### 1. Why LangGraph over LangChain-only or AutoGPT?
-- **Deterministic Control**: Traditional "Agent" frameworks often suffer from "infinite loops" or unpredictable tool usage. LangGraph allows us to define a strict state machine where transitions (e.g., Validation -> LLM -> Action) are governed by code, not just prompts.
-- **Auditability**: Every transition in the graph is a checkpoint in PostgreSQL. We can "time-travel" to see exactly why an agent made a specific decision at a specific node.
-- **Safe Tool Execution**: Tools like `send_slack_alert` are not called directly by the LLM in a "Cowboy" fashion. They are orchestrated within specific nodes that have access to validated system state.
-
-### 2. Asynchronous vs. Synchronous
-- **Trade-off**: `async` code is slightly more complex to write/debug.
-- **Decision**: We chose a 100% non-blocking architecture (FastAPI + Async Python) because high-volume postcard processing shouldn't stall on a slow OpenAI response. This allows the system to scale horizontally with minimal CPU overhead.
-
----
-
-## 🛡️ Security, Risk Mitigation & Edge Cases
-
-### 1. Edge Case Handling
-- **Prompt Injection**: Mitigated by strict Pydantic schema enforcement. The agent's output *must* conform to a boolean/enum result; it cannot simply "tell the system to do something else."
-- **PII Leakage**: The pipeline includes a deterministic validation step that checks for obvious sensitive patterns before the content is sent to an external LLM.
-- **Rate Limit Exhaustion (HTTP 429)**: Mitigated by **Exponential Backoff** (node-level) and a **Graceful Fallback** to the Human review queue. The system never returns a 500; it simply alerts a moderator.
-
-### 2. Safe Tool Execution & Final Authority
-- **No "Ghost" Emails**: The `send_email_to_user` tool is only invoked on a `REJECTED` status. If the model is uncertain, it is *forced* to route to the HITL app.
-- **Human Supremacy**: The Streamlit interface acts as the **Final Authority**. A human decision in the `human_reviews` table overrides any previous AI classification, ensuring that the "Brand Voice" is always protected.
+| Layer | Technology |
+|---|---|
+| API | FastAPI + Uvicorn (async) |
+| Orchestration | LangGraph `StateGraph` |
+| LLM | OpenAI `gpt-4o` via `langchain_openai` |
+| Structured output | Pydantic v2 (`with_structured_output`) |
+| Persistence / checkpointing | PostgreSQL + `AsyncPostgresSaver` (`langgraph-checkpoint-postgres`) |
+| Human review UI | Streamlit |
+| Rate limiting | `slowapi` |
+| Auth | `python-jose` / `passlib` / `bcrypt` |
+| Infra | Docker Compose (API + Postgres on port 5435) |
 
 ---
 
-## 📊 Observability & Operational Risks
+## Local Setup
 
-### 1. What is Observed?
-- **Token Utilization**: Each request tracks its token count to monitor the cost per postcard.
-- **Classification Accuracy**: By comparing AI decisions against the `human_reviews` audit log, we calculate a **Precision/Recall** metric for the agent.
-- **Latency**: We monitor node-level timing to identify bottlenecks in the reasoning process.
+**Prerequisites:** Python 3.11+, Docker, Docker Compose, an OpenAI API key.
 
-### 2. Economic Risks
-- **Cost Runaway**: Mitigated by setting strict `max_retries` on AI nodes. If a decision isn't reached in 3 attempts, it is flagged for a human to prevent burning tokens on recursive reasoning.
-
----
-
-## 🚀 Getting Started
-
-### 1. Prerequisites
-- **Python 3.11+**
-- **Docker & Docker Compose**
-- **OpenAI API Key**
-
-### 2. Installation & Run
 ```bash
-# Setup Environment
+# 1. Install Python dependencies
 make install
-cp .env.example .env
 
-# Launch Infrastructure (API + DB)
+# 2. Configure environment
+cp .env.example .env
+# Edit .env — set OPENAI_API_KEY and review DATABASE_SYNC_URL
+
+# 3. Start Postgres + API
 make up
 
-# Run HITL Dashboard
+# 4. Launch the HITL Streamlit dashboard (separate terminal)
 make run-hitl
 ```
 
+The API is available at `http://localhost:8000`. The Streamlit dashboard runs at `http://localhost:8501`.
+
 ---
 
-## 🧪 Testing
+## Sending a Request
 
-### **A. End-to-End Automated Test Suite**
-```bash
-# Integration Tests
-python3 tests/verify_full_functionality.py
-
-# LLM-as-a-Judge Eval Suite
-PYTHONPATH=. python3 tests/eval_suite.py
-```
-
-### **B. Manual Testing (cURL)**
-The API uses an authenticated header: `X-Agentic-API-Key: agentic-demo-key-123`.
-
-**Evaluate a Postcard:**
 ```bash
 curl -X POST "http://localhost:8000/api/v1/postcards/evaluate" \
      -H "Content-Type: application/json" \
      -H "X-Agentic-API-Key: agentic-demo-key-123" \
      -d '{
-       "id": "pc-888", 
-       "user_id": "u-123", 
-       "text_content": "This is a beautiful test postcard!"
+       "id": "pc-001",
+       "user_id": "u-123",
+       "text_content": "Wishing you a wonderful birthday from all of us!"
      }'
 ```
 
 ---
 
-## 🏗️ Database Optimization & Scalability
+## Key Patterns
 
-The persistence layer is designed for enterprise-grade reliability and performance:
+### Graceful LLM Fallback
 
-- **Stateful Persistence (LangGraph)**: Every "reasoning journey" is saved as a binary checkpoint in PostgreSQL. This allows the system to recover from crashes mid-execution and provides a complete audit trail of the agent's logic.
-- **Scalable Indexing**: The `checkpoints` and `human_reviews` tables are indexed for high-concurrency retrieval. As the system scales to millions of postcards, lookups for specific `thread_id`s remain $O(1)$ to $O(\log n)$.
-- **Security & Integrity**: 
-    - **Lease-Based Locking**: LangGraph uses PostgreSQL to ensure that only one worker can process a specific `thread_id` at a time, preventing race conditions in distributed environments.
-    - **ACID Compliance**: Every human resolution and AI decision is committed within a transaction, ensuring that the "Brand Safety" audit log is never corrupted.
-- **Efficient I/O**: We use `AsyncPostgresSaver` with a connection pool, allowing the system to handle thousands of concurrent DB operations without exhausting system resources.
+When the LLM is unavailable (no API key, rate limit, network error), the pipeline never returns HTTP 500. Instead it returns `NEEDS_REVIEW` and routes the submission to the human dashboard:
+
+```python
+# src/agent/llm_step.py — finalize_evaluation_node
+except Exception as e:
+    logger.error(f"Structured Parsing failed: {e}. Fallback to NEEDS_REVIEW.")
+    fallback = PostcardEvaluation(
+        status=QAStatus.NEEDS_REVIEW,
+        reasoning="Automated moderation failed due to technical parsing error. Handing over to Human.",
+        suggested_corrections=None
+    )
+    return {"evaluation": fallback}
+```
+
+### Pydantic Schema Enforcement
+
+The LLM's output is constrained to a typed `PostcardEvaluation` model. This prevents prompt injection: the agent cannot instruct the system to "do something else" because the only output surface is a boolean enum (`APPROVED | REJECTED | NEEDS_REVIEW`).
+
+### PostgreSQL Checkpointing
+
+Every node transition in the LangGraph `StateGraph` is written to Postgres via `AsyncPostgresSaver`. If the API process dies mid-evaluation, the next invocation with the same `thread_id` resumes from the last checkpoint. This also provides full "time-travel" debugging — you can inspect exactly which node produced which state.
+
+### Human Supremacy
+
+A human decision written to the `human_reviews` table overrides any prior AI classification. The Streamlit UI provides the final authority; the AI is an advisor, not a decision-maker.
 
 ---
 
-## 📋 Requirement Traceability (Interview Dashboard)
+## Health Extension
 
-This project explicitly satisfies all 6 core requirements and the "system that builds systems" mandatory criteria:
+`src/health_extension/chw_triage.py` shows how the same pipeline adapts to community health worker (CHW) clinical triage for iCCM (Integrated Community Case Management) in sub-Saharan Africa.
 
-| Requirement | Implementation Detail | Location |
-| :--- | :--- | :--- |
-| **1. Accept Input** | FastAPI REST Endpoint (`POST /evaluate`) | `src/api/routes.py` |
-| **2. Purposeful LLM Step** | Agentic Reasoning & Policy Evaluation | `src/agent/llm_step.py` |
-| **3. Deterministic Step** | Content length & regex validation | `src/engine/pipeline.py` |
-| **4. Automated Action** | Slack Alerts, Email Dispatch, DB Persistence | `src/agent/tools.py` |
-| **5. Failure Handling** | Exponential Backoff + Fallback to Human Review | `src/agent/llm_step.py` |
-| **6. Output Validation** | Pydantic Schema Enforcement (Structured Outputs) | `src/models/schemas.py` |
+The mapping is direct:
 
-### 🏗️ "System that Builds Systems" (Reusability)
-The project is built on a **Workflow Runner** pattern. 
-- **Reusable Core**: `src/engine/config_runner.py` provides a generic `WorkflowRunner` that accepts any sequence of async/sync steps.
-- **Scalability**: Adding a new business workflow (e.g., "Email Receipt QA") takes **<15 minutes** by simply defining new step functions and composing them in a new runner instance.
+| Digital Postcard | CHW Triage |
+|---|---|
+| `PostcardSubmission` | `CHWPatientReport` (FHIR Encounter + Observations) |
+| `QAStatus` enum | `TriageDecision` enum (REFER_EMERGENCY / REFER_ROUTINE / TREAT_IN_PLACE / ESCALATE) |
+| Content moderation prompt | iCCM clinical decision support prompt |
+| Streamlit human review | Supervisor review gate before CHW acts |
+| Slack / email dispatch | SMS to CHW + DHIS2 log + facility alert |
+| `human_reviews` table | Clinical audit log (FHIR ClinicalImpression) |
+
+Pydantic validators in `CHWPatientReport` enforce plausible clinical ranges (MUAC 60–250 mm, temperature 30–43°C) as a data quality layer before any LLM token is spent. The `CHWTriageOutput` model includes `dq_flags` so MERL teams can track measurement outliers independently of the triage decision.
 
 ---
 
-## 📂 Repository Structure
-- `/src/agent`: LangGraph state machine, resilient LLM nodes, and operational tools.
-- `/src/engine`: The **Workflow Runner** core and specific pipeline steps.
-- `/src/api`: FastAPI entrypoints and security layer.
-- `/infra`: Docker, Database initializers (`init.sql`), and environment templates.
-- `/scripts`: Demo seeding and utility scripts.
+## Running Tests
+
+```bash
+# Integration test suite
+python3 tests/verify_full_functionality.py
+
+# LLM-as-a-Judge evaluation
+PYTHONPATH=. python3 tests/eval_suite.py
+```
+
+---
+
+## Production Scaling
+
+| Concern | Approach |
+|---|---|
+| Compute | ECS Fargate (stateless API containers, scale horizontally) |
+| Database | RDS PostgreSQL (Multi-AZ for HA) |
+| Checkpoint isolation | LangGraph PostgreSQL lease-based locking — one worker per `thread_id`, no race conditions |
+| Cost control | `max_retries=3` on LLM nodes; LangSmith token tracking per request |
+| Observability | Loguru structured logs + LangSmith traces; node-level latency visible in trace timeline |
+
+The `AsyncPostgresSaver` with connection pooling (`psycopg_pool`) is the key scaling enabler: because every in-flight reasoning state is in Postgres rather than process memory, you can run N identical API replicas behind a load balancer and any replica can pick up any in-progress evaluation on restart.
+
+---
+
+## Repository Structure
+
+```
+src/
+  agent/          LangGraph state machine, resilient LLM nodes, operational tools
+  api/            FastAPI routes, auth, rate limiting
+  engine/         WorkflowRunner core and pipeline step composition
+  health_extension/  CHW triage adaptation (HITL pattern → clinical decision support)
+  models/         Pydantic schemas (PostcardSubmission, PostcardEvaluation, etc.)
+  utils/          Logger, reliability helpers
+  hitl_app.py     Streamlit human review dashboard
+  main.py         FastAPI app entrypoint
+infra/            Docker Compose, Postgres init SQL, environment templates
+scripts/          Demo seeding utilities
+tests/            Integration + eval suite
+```
